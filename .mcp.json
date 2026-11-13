@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "hal-hook": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "hal_hook_mcp"],
+      "env": {
+        "HAL_HOOK_MCP_LOG": "INFO"
+      }
+    }
+  }
+}
