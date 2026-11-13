@@ -1,0 +1,29 @@
+#!/system/bin/sh
+# Launcher — AH spawns this as its MCP subprocess. Sets LD_LIBRARY_PATH /
+# PYTHONPATH so AH's bundled python3 can load our package.
+#
+# Stdio by default:  ./hal-hook-mcp
+# HTTP:              ./hal-hook-mcp --http [--host H --port P --token T]
+#
+# Any args pass through to `python -m hal_hook_mcp`.
+
+# Derive MOD from this script's own location so the launcher works both from
+# /data/adb/modules_update/ (pre-reboot staging) and /data/adb/modules/
+# (post-reboot active). `realpath` follows any symlink KSU may create.
+SCRIPT="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+MOD="$(cd "$(dirname "$SCRIPT")/.." && pwd)"
+AH_LINUX=/data/user/0/com.androidharness.app/files/linux
+AH_PY="${AH_LINUX}/bin/python3"
+MOD_DEPS="${MOD}/deps"
+
+# AH's python needs its own libs (libandroid-support etc.) on LD path. We
+# ALSO prepend our module-private deps + pylib so imports resolve without
+# touching AH's site-packages.
+export LD_LIBRARY_PATH="${AH_LINUX}/lib:${LD_LIBRARY_PATH:-}"
+export PYTHONPATH="${MOD}/pylib:${MOD_DEPS}/lib/python3.14/site-packages:${PYTHONPATH:-}"
+# Force native transport in case auto-detect fails for any reason.
+export HAL_HOOK_TRANSPORT=native
+# AH's chroot expects PREFIX for Termux-style path lookups.
+export PREFIX="${AH_LINUX}"
+
+exec "${AH_PY}" -m hal_hook_mcp "$@"

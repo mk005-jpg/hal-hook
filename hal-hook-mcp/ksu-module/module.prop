@@ -1,0 +1,7 @@
+id=hal_hook_mcp
+name=HAL Hook MCP (on-device)
+version=v0.1.0
+versionCode=1
+author=hal-hook
+description=On-device MCP server that gives AndroidHarness (and any other local MCP client) direct control of the hal-inject camera-injection framework. Native unix-socket transport, no adb, no PC.
+updateJson=

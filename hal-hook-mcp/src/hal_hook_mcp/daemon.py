@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from typing import Optional
 
-from .transport import adb_shell, daemon_send, DaemonResponse, CTRL_DIR
+from .transport import adb_shell, daemon_send, DaemonResponse, CTRL_DIR, read_ctrl_file
 
 
 def _ok(cmd: str) -> dict:
@@ -31,22 +31,17 @@ def status() -> dict:
     return {"daemon": daemon_json, "ctrl": ctrl, "raw": r.raw}
 
 
+CTRL_NAMES = (
+    "ctrl", "ctrl_yuv", "ctrl_cam", "cur_cam", "ctrl_slot", "ctrl_fmt",
+    "ctrl_noise", "ctrl_composite", "ctrl_region", "ctrl_content_pad",
+    "ctrl_blob_res_w", "ctrl_blob_res_h",
+)
+
+
 def ctrl_files() -> dict:
-    """Read every ctrl_* file off the device in one shell round-trip."""
-    cmd = (
-        f"for f in {CTRL_DIR}/ctrl {CTRL_DIR}/ctrl_yuv {CTRL_DIR}/ctrl_cam "
-        f"{CTRL_DIR}/cur_cam {CTRL_DIR}/ctrl_slot {CTRL_DIR}/ctrl_fmt "
-        f"{CTRL_DIR}/ctrl_noise {CTRL_DIR}/ctrl_composite {CTRL_DIR}/ctrl_region "
-        f"{CTRL_DIR}/ctrl_content_pad {CTRL_DIR}/ctrl_blob_res_w {CTRL_DIR}/ctrl_blob_res_h; "
-        f"do printf \"%s=%s\\n\" \"$(basename $f)\" \"$(cat $f 2>/dev/null)\"; done"
-    )
-    out = adb_shell(cmd, as_root=True)
-    result: dict = {}
-    for ln in out.splitlines():
-        if "=" in ln:
-            k, v = ln.split("=", 1)
-            result[k.strip()] = v.strip()
-    return result
+    """Read every known ctrl_* file. Transport-neutral: on-device it's a
+    direct open(); over-adb it's a shell round-trip via read_ctrl_file."""
+    return {name: read_ctrl_file(name) for name in CTRL_NAMES}
 
 
 def start() -> dict:              return _ok("START")

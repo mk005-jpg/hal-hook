@@ -4,12 +4,12 @@ version = "0.1.0"
 description = "MCP server exposing hal-inject daemon control + target-app camera probing to Claude and AndroidHarness"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
-    "mcp>=1.0.0",
-    "pillow>=10.0.0",   # BLOB thumbnail + dim probing
-    "starlette>=0.37",  # HTTP/SSE server (used by --http mode)
-    "uvicorn>=0.30",    # ASGI runner for HTTP mode
-]
+dependencies = []   # stdlib-only — see mini_mcp.py
+
+[project.optional-dependencies]
+# BLOB preview dim-probing is nicer with Pillow but handlers fall back cleanly
+# if it's absent (hal_pull_slot_blob returns dims=None instead of a WxH).
+preview = ["pillow>=10.0.0"]
 
 [project.scripts]
 hal-hook-mcp = "hal_hook_mcp.__main__:main"

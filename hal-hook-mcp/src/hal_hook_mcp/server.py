@@ -1,11 +1,12 @@
-"""MCP server registrations.
+"""MCP server using the stdlib-only mini_mcp implementation.
 
-Exposes hal-inject daemon control, logcat streaming, and the KYC-target probe
-plugin as MCP tools + resources. Transport: stdio (default) — the client
-(Claude Desktop, AndroidHarness, etc.) spawns `hal-hook-mcp` and talks over
-stdin/stdout. HTTP/SSE can be added later; see README.
+Rewritten from the previous mcp-SDK-based server so the whole stack has zero
+pip dependencies — the SDK's Rust-compiled transitive deps (pydantic-core,
+rpds-py, cryptography) do not build on aarch64-android, which was blocking
+the on-device install.
 
-Tools return JSON-serializable dicts; MCP's CallToolResult wraps them."""
+Tools + resources are identical to the prior SDK version; only the transport
+layer and registration decorators changed."""
 from __future__ import annotations
 
 import base64
@@ -14,324 +15,237 @@ import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import Optional
 
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import (
-    Resource,
-    TextContent,
-    Tool,
+from . import daemon, probe
+from .mini_mcp import Server
+from .transport import (
+    adb_shell, chmod, check_daemon_up, logcat_dump, logcat_stream,
+    pull_file, push_file, CTRL_DIR,
 )
-
-from . import daemon, monitor, probe
-from .transport import adb_pull, adb_push, adb_shell, check_daemon_up, CTRL_DIR
 
 log = logging.getLogger(__name__)
 
-app = Server("hal-hook-mcp")
+app = Server("hal-hook-mcp", version="0.2.0")
 
-# ── Tool catalogue ─────────────────────────────────────────────────────────
+# ── Control tools ──────────────────────────────────────────────────────────
 
-TOOLS: list[Tool] = [
-    Tool(
-        name="hal_status",
-        description="Snapshot of the hal-inject daemon state: STATUS JSON, every ctrl_* file, cameraserver PID + libcam_hook map count. Call this first in any session to confirm the stack is up.",
-        inputSchema={"type": "object", "properties": {}, "required": []},
-    ),
-    Tool(
-        name="hal_start",
-        description="Arm the daemon (equivalent of the Android app's Start button). Enables injection.",
-        inputSchema={"type": "object", "properties": {}, "required": []},
-    ),
-    Tool(
-        name="hal_stop",
-        description="Disarm the daemon. Camera traffic passes through unmodified.",
-        inputSchema={"type": "object", "properties": {}, "required": []},
-    ),
-    Tool(
-        name="hal_set_cam",
-        description="Pick which camera facing to inject on: 'back' (ID doc capture), 'front' (selfie) or 'both'.",
-        inputSchema={"type": "object",
-                     "properties": {"mode": {"type": "string",
-                                              "enum": ["back", "front", "both"]}},
-                     "required": ["mode"]},
-    ),
-    Tool(
-        name="hal_set_slot",
-        description="Activate a prepared media slot ('idfront' or 'idback'). Prepare slots via hal_push_slot_image.",
-        inputSchema={"type": "object",
-                     "properties": {"slot": {"type": "string",
-                                              "enum": ["idfront", "idback"]}},
-                     "required": ["slot"]},
-    ),
-    Tool(
-        name="hal_set_fmt",
-        description="YUV chroma order for the injected slot: 'nv21' or 'nv12'.",
-        inputSchema={"type": "object",
-                     "properties": {"fmt": {"type": "string",
-                                             "enum": ["nv21", "nv12"]}},
-                     "required": ["fmt"]},
-    ),
-    Tool(
-        name="hal_set_yuv_width",
-        description="Minimum YUV stream width to inject on (0 disables YUV inject). BLOB inject is unaffected.",
-        inputSchema={"type": "object",
-                     "properties": {"width": {"type": "integer", "minimum": 0}},
-                     "required": ["width"]},
-    ),
-    Tool(
-        name="hal_set_composite",
-        description="Toggle the Step-1 region compositor (1=region composite+realism passes, 0=legacy full-overwrite).",
-        inputSchema={"type": "object",
-                     "properties": {"on": {"type": "boolean"}},
-                     "required": ["on"]},
-    ),
-    Tool(
-        name="hal_set_region",
-        description="Where in the sensor frame the ID is painted. All floats normalized 0..1.",
-        inputSchema={"type": "object",
-                     "properties": {"cx": {"type": "number"}, "cy": {"type": "number"},
-                                     "w": {"type": "number"}, "h": {"type": "number"}},
-                     "required": ["cx", "cy", "w", "h"]},
-    ),
-    Tool(
-        name="hal_set_content_pad",
-        description="Content-PAD strength 0..200 (fibre + laminate-specular pass vs 'digital screen' detectors).",
-        inputSchema={"type": "object",
-                     "properties": {"percent": {"type": "integer", "minimum": 0, "maximum": 200}},
-                     "required": ["percent"]},
-    ),
-    Tool(
-        name="hal_set_blob_res",
-        description="Force BLOB rescale target (w, h). (0, 0) = AUTO: hook matches KYC-negotiated stream dims per call.",
-        inputSchema={"type": "object",
-                     "properties": {"w": {"type": "integer", "minimum": 0},
-                                     "h": {"type": "integer", "minimum": 0}},
-                     "required": ["w", "h"]},
-    ),
-    Tool(
-        name="hal_push_slot_image",
-        description="Push a YUV and/or BLOB JPEG from the host into a slot. local_yuv and/or local_blob are host-side absolute paths. The daemon converts them to frame_<slot>.{nv21,nv12,jpg} and applies.",
-        inputSchema={"type": "object",
-                     "properties": {"slot": {"type": "string",
-                                              "enum": ["idfront", "idback"]},
-                                     "local_yuv": {"type": "string"},
-                                     "local_blob": {"type": "string"}},
-                     "required": ["slot"]},
-    ),
-    Tool(
-        name="hal_snap_yuv",
-        description="Dump the next pre-composite real YUV frame (or the cached one if no live stream) to <device_dst>, then pull to the host. Returns WxH and the saved local path.",
-        inputSchema={"type": "object",
-                     "properties": {"local_dst": {"type": "string"}},
-                     "required": ["local_dst"]},
-    ),
-    Tool(
-        name="hal_pull_slot_blob",
-        description="Fetch the current frame_<slot>.jpg from the device as base64 + its dims. Useful to verify what the hook is about to inject.",
-        inputSchema={"type": "object",
-                     "properties": {"slot": {"type": "string",
-                                              "enum": ["idfront", "idback"]}},
-                     "required": ["slot"]},
-    ),
-    Tool(
-        name="hal_logcat_tail",
-        description="Dump the last N lines of logcat, optionally regex-filtered. Default pattern matches cam_hook.",
-        inputSchema={"type": "object",
-                     "properties": {"lines": {"type": "integer", "default": 200, "minimum": 10, "maximum": 5000},
-                                     "pattern": {"type": "string", "default": "cam_hook"}},
-                     "required": []},
-    ),
-    Tool(
-        name="hal_watch_captures",
-        description="Open a bounded logcat stream and collect structured cam_hook events (returnBuffer BLOB, write_blob RESCALE, write_yuv, snap, meta). Use duration_s 5-60.",
-        inputSchema={"type": "object",
-                     "properties": {"duration_s": {"type": "number", "minimum": 1, "maximum": 300, "default": 15}},
-                     "required": []},
-    ),
-    Tool(
-        name="hal_probe_target",
-        description="Launch (or attach to) a KYC target package, watch its camera mechanics for duration_s, and return a structured report: detected SDKs, negotiated stream dims, hook injection events, dim-match analysis. The 'make Wise work' first-call tool.",
-        inputSchema={"type": "object",
-                     "properties": {"package": {"type": "string",
-                                                 "description": "Android package, e.g. com.transferwise.android"},
-                                     "duration_s": {"type": "number", "default": 30, "minimum": 5, "maximum": 300},
-                                     "launch": {"type": "boolean", "default": True,
-                                                "description": "If true, monkey-launch the target before watching."},
-                                     "verbose": {"type": "boolean", "default": False}},
-                     "required": ["package"]},
-    ),
-    Tool(
-        name="hal_adb_shell",
-        description="Escape hatch — run an arbitrary adb shell command on the device (as_root optional). For anything the typed tools don't cover.",
-        inputSchema={"type": "object",
-                     "properties": {"cmd": {"type": "string"},
-                                     "as_root": {"type": "boolean", "default": False}},
-                     "required": ["cmd"]},
-    ),
-]
+@app.tool("hal_status",
+          "Snapshot of the hal-inject daemon state: STATUS JSON, every ctrl_* file, cameraserver PID + libcam_hook map count. Call first.",
+          {"type": "object", "properties": {}, "required": []})
+def _hal_status(a):
+    up, msg = check_daemon_up()
+    if not up:
+        return {"ok": False, "error": msg}
+    return daemon.status()
 
 
-@app.list_tools()
-async def list_tools() -> list[Tool]:
-    return TOOLS
+@app.tool("hal_start", "Arm the daemon (equivalent of the app's Start). Enables injection.",
+          {"type": "object", "properties": {}, "required": []})
+def _hal_start(a): return daemon.start()
+
+@app.tool("hal_stop", "Disarm the daemon. Camera passes through unmodified.",
+          {"type": "object", "properties": {}, "required": []})
+def _hal_stop(a): return daemon.stop()
 
 
-# ── Tool dispatch ──────────────────────────────────────────────────────────
+@app.tool("hal_set_cam", "Pick which camera facing to inject on.",
+          {"type": "object",
+           "properties": {"mode": {"type": "string", "enum": ["back", "front", "both"]}},
+           "required": ["mode"]})
+def _hal_set_cam(a): return daemon.set_cam(a["mode"])
 
-def _t(obj) -> list[TextContent]:
-    return [TextContent(type="text", text=json.dumps(obj, indent=2, default=str))]
+@app.tool("hal_set_slot", "Activate a prepared media slot.",
+          {"type": "object",
+           "properties": {"slot": {"type": "string", "enum": ["idfront", "idback"]}},
+           "required": ["slot"]})
+def _hal_set_slot(a): return daemon.set_slot(a["slot"])
+
+@app.tool("hal_set_fmt", "YUV chroma order for the injected slot.",
+          {"type": "object",
+           "properties": {"fmt": {"type": "string", "enum": ["nv21", "nv12"]}},
+           "required": ["fmt"]})
+def _hal_set_fmt(a): return daemon.set_fmt(a["fmt"])
+
+@app.tool("hal_set_yuv_width", "Minimum YUV stream width to inject on (0 disables YUV inject).",
+          {"type": "object",
+           "properties": {"width": {"type": "integer", "minimum": 0}},
+           "required": ["width"]})
+def _hal_set_yuv_width(a): return daemon.set_yuv_width(a["width"])
+
+@app.tool("hal_set_composite", "Toggle the Step-1 region compositor.",
+          {"type": "object",
+           "properties": {"on": {"type": "boolean"}},
+           "required": ["on"]})
+def _hal_set_composite(a): return daemon.set_composite(a["on"])
+
+@app.tool("hal_set_region", "Where in the sensor frame the ID is painted. 0..1 normalized.",
+          {"type": "object",
+           "properties": {"cx": {"type": "number"}, "cy": {"type": "number"},
+                          "w":  {"type": "number"}, "h":  {"type": "number"}},
+           "required": ["cx", "cy", "w", "h"]})
+def _hal_set_region(a):
+    return daemon.set_region(a["cx"], a["cy"], a["w"], a["h"])
+
+@app.tool("hal_set_content_pad",
+          "Content-PAD strength 0..200 (fibre + laminate-specular pass vs 'digital screen' detectors).",
+          {"type": "object",
+           "properties": {"percent": {"type": "integer", "minimum": 0, "maximum": 200}},
+           "required": ["percent"]})
+def _hal_set_content_pad(a): return daemon.set_content_pad(a["percent"])
+
+@app.tool("hal_set_blob_res",
+          "Force BLOB rescale target. (0, 0) = AUTO: hook matches KYC-negotiated stream dims per call.",
+          {"type": "object",
+           "properties": {"w": {"type": "integer", "minimum": 0},
+                          "h": {"type": "integer", "minimum": 0}},
+           "required": ["w", "h"]})
+def _hal_set_blob_res(a): return daemon.set_blob_res(a["w"], a["h"])
 
 
-@app.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+@app.tool("hal_push_slot_image",
+          "Push a YUV and/or BLOB JPEG into a slot. On-device: paths are read directly. Over adb: pushed first.",
+          {"type": "object",
+           "properties": {"slot":       {"type": "string", "enum": ["idfront", "idback"]},
+                          "local_yuv":  {"type": "string"},
+                          "local_blob": {"type": "string"}},
+           "required": ["slot"]})
+def _hal_push_slot_image(a):
+    slot = a["slot"]
+    ly = a.get("local_yuv"); lb = a.get("local_blob")
+    if not ly and not lb:
+        return {"ok": False, "error": "need at least one of local_yuv, local_blob"}
+    dev_cache = f"/data/local/tmp/hal_inject_push_{slot}"
+    adb_shell(f"mkdir -p {dev_cache}", as_root=True, timeout=5)
+    dev_yuv  = f"{dev_cache}/yuv.jpg"  if ly else ""
+    dev_blob = f"{dev_cache}/blob.jpg" if lb else ""
+    if ly: push_file(ly, dev_yuv)
+    if lb: push_file(lb, dev_blob)
+    adb_shell(f"chmod -R 644 {dev_cache}/*.jpg 2>/dev/null || true",
+              as_root=True, timeout=5)
+    r = daemon.set_slot_image(slot, dev_yuv or dev_blob, dev_blob or dev_yuv)
+    return {**r, "pushed": {"yuv": dev_yuv, "blob": dev_blob}}
+
+
+@app.tool("hal_snap_yuv",
+          "Dump the next pre-composite real YUV frame (or the cached one) to <local_dst> and return dims.",
+          {"type": "object",
+           "properties": {"local_dst": {"type": "string"}},
+           "required": ["local_dst"]})
+def _hal_snap_yuv(a):
+    local_dst = a["local_dst"]
+    device_dst = "/data/local/tmp/hal_inject_mcp_snap.nv21"
+    r = daemon.snap_yuv(device_dst)
+    if not r.get("ok"):
+        return r
+    adb_shell(f"chmod 644 {device_dst} {device_dst.rsplit('.',1)[0]}.dim",
+              as_root=True, timeout=5)
+    os.makedirs(os.path.dirname(os.path.abspath(local_dst)) or ".", exist_ok=True)
+    pull_file(device_dst, local_dst)
+    pull_file(device_dst.rsplit(".", 1)[0] + ".dim", local_dst + ".dim")
+    return {**r, "local_path": local_dst}
+
+
+@app.tool("hal_pull_slot_blob",
+          "Fetch the current frame_<slot>.jpg from the device; return dims + base64 preview (first 96 KiB).",
+          {"type": "object",
+           "properties": {"slot": {"type": "string", "enum": ["idfront", "idback"]}},
+           "required": ["slot"]})
+def _hal_pull_slot_blob(a):
+    slot = a["slot"]
+    remote = f"{CTRL_DIR}/frame_{slot}.jpg"
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tf:
+        local = tf.name
+    adb_shell(f"chmod 644 {remote} 2>/dev/null || true",
+              as_root=True, timeout=5)
+    pull_file(remote, local)
+    dims = None
     try:
-        if name == "hal_status":
-            up, msg = check_daemon_up()
-            if not up:
-                return _t({"ok": False, "error": msg})
-            return _t(daemon.status())
+        # Pillow is optional — if not installed, just skip dim probing.
+        from PIL import Image
+        with Image.open(local) as im:
+            dims = f"{im.width}x{im.height}"
+    except Exception:
+        pass
+    data = Path(local).read_bytes()
+    b64 = base64.b64encode(data[:96 * 1024]).decode("ascii")
+    return {"slot": slot, "remote": remote, "local": local,
+            "dims": dims, "bytes": len(data),
+            "preview_b64_first_96k": b64}
 
-        if name == "hal_start":           return _t(daemon.start())
-        if name == "hal_stop":            return _t(daemon.stop())
-        if name == "hal_set_cam":         return _t(daemon.set_cam(arguments["mode"]))
-        if name == "hal_set_slot":        return _t(daemon.set_slot(arguments["slot"]))
-        if name == "hal_set_fmt":         return _t(daemon.set_fmt(arguments["fmt"]))
-        if name == "hal_set_yuv_width":   return _t(daemon.set_yuv_width(arguments["width"]))
-        if name == "hal_set_composite":   return _t(daemon.set_composite(arguments["on"]))
-        if name == "hal_set_region":
-            return _t(daemon.set_region(arguments["cx"], arguments["cy"],
-                                        arguments["w"], arguments["h"]))
-        if name == "hal_set_content_pad": return _t(daemon.set_content_pad(arguments["percent"]))
-        if name == "hal_set_blob_res":    return _t(daemon.set_blob_res(arguments["w"], arguments["h"]))
 
-        if name == "hal_push_slot_image":
-            slot = arguments["slot"]
-            ly = arguments.get("local_yuv")
-            lb = arguments.get("local_blob")
-            if not ly and not lb:
-                return _t({"ok": False, "error": "need at least one of local_yuv, local_blob"})
-            # Push to device cache then call SET_SLOT_IMAGE. The daemon copies
-            # them into its own CTRL_DIR with the right names.
-            dev_cache = f"/data/local/tmp/hal_inject_push_{slot}"
-            adb_shell(f"mkdir -p {dev_cache}", as_root=True, timeout=5)
-            dev_yuv = f"{dev_cache}/yuv.jpg" if ly else ""
-            dev_blob = f"{dev_cache}/blob.jpg" if lb else ""
-            if ly: adb_push(ly, dev_yuv)
-            if lb: adb_push(lb, dev_blob)
-            # chmod so the daemon (root) can read them from either path
-            adb_shell(f"chmod -R 644 {dev_cache}/*.jpg 2>/dev/null || true",
-                      as_root=True, timeout=5)
-            r = daemon.set_slot_image(slot, dev_yuv or dev_blob,
-                                       dev_blob or dev_yuv)
-            return _t({**r, "pushed": {"yuv": dev_yuv, "blob": dev_blob}})
+@app.tool("hal_logcat_tail",
+          "Dump the last N lines of logcat, optionally regex-filtered. Default pattern matches cam_hook.",
+          {"type": "object",
+           "properties": {"lines":   {"type": "integer", "default": 200, "minimum": 10, "maximum": 5000},
+                          "pattern": {"type": "string",  "default": "cam_hook"}},
+           "required": []})
+def _hal_logcat_tail(a):
+    lines = int(a.get("lines", 200))
+    pattern = a.get("pattern", "cam_hook")
+    return logcat_dump(lines=lines, grep=pattern)   # str → text content block
 
-        if name == "hal_snap_yuv":
-            local_dst = arguments["local_dst"]
-            # ask daemon to put it in a known device path (world-readable by root)
-            device_dst = "/data/local/tmp/hal_inject_mcp_snap.nv21"
-            r = daemon.snap_yuv(device_dst)
-            if not r.get("ok"):
-                return _t(r)
-            # chmod + pull
-            adb_shell(f"chmod 644 {device_dst} {device_dst.rsplit('.',1)[0]}.dim",
-                      as_root=True, timeout=5)
-            os.makedirs(os.path.dirname(os.path.abspath(local_dst)) or ".", exist_ok=True)
-            adb_pull(device_dst, local_dst)
-            adb_pull(device_dst.rsplit(".", 1)[0] + ".dim", local_dst + ".dim")
-            return _t({**r, "local_path": local_dst})
 
-        if name == "hal_pull_slot_blob":
-            slot = arguments["slot"]
-            remote = f"{CTRL_DIR}/frame_{slot}.jpg"
-            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tf:
-                local = tf.name
-            # chmod in case the mode drifted
-            adb_shell(f"chmod 644 {remote} 2>/dev/null || true",
-                      as_root=True, timeout=5)
-            adb_pull(remote, local)
-            dims = None
-            try:
-                from PIL import Image
-                with Image.open(local) as im:
-                    dims = f"{im.width}x{im.height}"
-            except Exception:
-                pass
-            data = Path(local).read_bytes()
-            b64 = base64.b64encode(data[:96 * 1024]).decode("ascii")  # cap preview at 96 KiB
-            return _t({"slot": slot, "remote": remote, "local": local,
-                       "dims": dims, "bytes": len(data),
-                       "preview_b64_first_96k": b64})
+@app.tool("hal_watch_captures",
+          "Bounded logcat stream: collect structured cam_hook events (returnBuffer BLOB, write_blob RESCALE, write_yuv, snap, meta).",
+          {"type": "object",
+           "properties": {"duration_s": {"type": "number", "minimum": 1, "maximum": 300, "default": 15}},
+           "required": []})
+def _hal_watch_captures(a):
+    dur = float(a.get("duration_s", 15))
+    events = logcat_stream(dur, grep="cam_hook")
+    return {"duration_s": dur, "count": len(events),
+            "events": [ev.to_json() for ev in events]}
 
-        if name == "hal_logcat_tail":
-            lines = int(arguments.get("lines", 200))
-            pattern = arguments.get("pattern", "cam_hook")
-            text = monitor.logcat_dump(lines=lines, grep=pattern)
-            return [TextContent(type="text", text=text)]
 
-        if name == "hal_watch_captures":
-            dur = float(arguments.get("duration_s", 15))
-            events = monitor.logcat_stream(dur, grep="cam_hook")
-            return _t({"duration_s": dur, "count": len(events),
-                       "events": [ev.to_json() for ev in events]})
+@app.tool("hal_probe_target",
+          "Launch a KYC target package, watch camera mechanics for duration_s, return detected SDKs + negotiated stream dims + hook events + dim-match verdict. The 'make Wise work' tool.",
+          {"type": "object",
+           "properties": {"package":    {"type": "string",
+                                         "description": "Android package, e.g. com.transferwise.android"},
+                          "duration_s": {"type": "number", "default": 30, "minimum": 5, "maximum": 300},
+                          "launch":     {"type": "boolean", "default": True},
+                          "verbose":    {"type": "boolean", "default": False}},
+           "required": ["package"]})
+def _hal_probe_target(a):
+    return probe.probe(a["package"], float(a.get("duration_s", 30)),
+                       launch=bool(a.get("launch", True)),
+                       verbose=bool(a.get("verbose", False)))
 
-        if name == "hal_probe_target":
-            pkg = arguments["package"]
-            dur = float(arguments.get("duration_s", 30))
-            launch = bool(arguments.get("launch", True))
-            verbose = bool(arguments.get("verbose", False))
-            return _t(probe.probe(pkg, dur, launch=launch, verbose=verbose))
 
-        if name == "hal_adb_shell":
-            cmd = arguments["cmd"]
-            as_root = bool(arguments.get("as_root", False))
-            out = adb_shell(cmd, as_root=as_root, timeout=30.0)
-            return [TextContent(type="text", text=out)]
-
-        return _t({"ok": False, "error": f"unknown tool: {name}"})
-
-    except Exception as e:
-        log.exception("tool %s failed", name)
-        return _t({"ok": False, "error": str(e), "type": type(e).__name__})
+@app.tool("hal_adb_shell",
+          "Escape hatch — run an arbitrary shell command on the device. On-device uses /system/bin/sh; over adb uses adb shell.",
+          {"type": "object",
+           "properties": {"cmd":     {"type": "string"},
+                          "as_root": {"type": "boolean", "default": False}},
+           "required": ["cmd"]})
+def _hal_adb_shell(a):
+    return adb_shell(a["cmd"], as_root=bool(a.get("as_root", False)), timeout=30.0)
 
 
 # ── Resources ──────────────────────────────────────────────────────────────
 
-RESOURCES: list[Resource] = [
-    Resource(uri="hal://state",  name="hal state",
-             description="Daemon STATUS + every ctrl_* file on the device, one JSON blob.",
-             mimeType="application/json"),
-    Resource(uri="hal://stats",  name="hal stats",
-             description="Latest stats.json the daemon wrote (bump counters, last frame info).",
-             mimeType="application/json"),
-    Resource(uri="hal://logcat",  name="recent cam_hook logcat",
-             description="Last 200 lines from logcat filtered to the cam_hook tag.",
-             mimeType="text/plain"),
-]
+@app.resource("hal://state", "hal state",
+              "Daemon STATUS + every ctrl_* file on the device, one JSON blob.",
+              "application/json")
+def _res_state(uri): return json.dumps(daemon.status(), indent=2, default=str)
 
 
-@app.list_resources()
-async def list_resources() -> list[Resource]:
-    return RESOURCES
+@app.resource("hal://stats", "hal stats",
+              "Latest stats.json the daemon wrote.",
+              "application/json")
+def _res_stats(uri):
+    return adb_shell(f"cat {CTRL_DIR}/stats.json 2>/dev/null || echo '{{}}'",
+                     as_root=True, timeout=5)
 
 
-@app.read_resource()
-async def read_resource(uri: str) -> str:
-    if uri == "hal://state":
-        return json.dumps(daemon.status(), indent=2, default=str)
-    if uri == "hal://stats":
-        out = adb_shell(f"cat {CTRL_DIR}/stats.json 2>/dev/null || echo '{{}}'",
-                        as_root=True, timeout=5)
-        return out
-    if uri == "hal://logcat":
-        return monitor.logcat_dump(lines=200, grep="cam_hook")
-    raise ValueError(f"unknown resource: {uri}")
+@app.resource("hal://logcat", "recent cam_hook logcat",
+              "Last 200 lines from logcat filtered to the cam_hook tag.",
+              "text/plain")
+def _res_logcat(uri): return logcat_dump(lines=200, grep="cam_hook")
 
 
 # ── Entry ──────────────────────────────────────────────────────────────────
 
-async def serve() -> None:
-    """Stdio server loop. Called from __main__."""
-    async with stdio_server() as (read, write):
-        await app.run(read, write, app.create_initialization_options())
+def serve_stdio() -> None:
+    """Called from __main__ for the default stdio mode."""
+    app.run_stdio()

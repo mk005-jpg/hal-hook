@@ -1,0 +1,27 @@
+#!/system/bin/sh
+# Stdlib-only MCP has no pip dependencies — this script exists only as a
+# compatibility stub and to allow installing the optional Pillow extra for
+# BLOB-thumbnail dim probing, if the user wants it.
+#
+# Usage: hal-hook-mcp-install-deps [--with-preview]
+
+set -e
+
+MOD=/data/adb/modules/hal_hook_mcp
+AH_LINUX=/data/user/0/com.androidharness.app/files/linux
+AH_PY="${AH_LINUX}/bin/python3"
+TARGET="${MOD}/deps"
+
+export LD_LIBRARY_PATH="${AH_LINUX}/lib:${LD_LIBRARY_PATH:-}"
+export PREFIX="${AH_LINUX}"
+
+if [ "${1:-}" = "--with-preview" ]; then
+    mkdir -p "${TARGET}"
+    echo "[deps] installing Pillow (optional) into ${TARGET}..."
+    "${AH_PY}" -m pip install --prefix "${TARGET}" --no-warn-script-location \
+        --disable-pip-version-check pillow
+    echo "[deps] done."
+else
+    echo "[deps] stdlib-only build — nothing to install. Pass --with-preview"
+    echo "       to install Pillow for BLOB thumbnail dim-probing."
+fi

@@ -23,7 +23,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Optional
 
-from .monitor import logcat_stream, pgrep
+from .transport import logcat_stream, pgrep
 from .parsers import Event
 from .transport import adb_shell
 
@@ -129,7 +129,7 @@ def probe(package: str, duration_s: float = 30.0, *,
     #   We don't start a second parallel stream (adb limits), instead we dump
     #   the full recent logcat and grep after the fact.
     # Use enough backlog to cover duration_s plus app startup.
-    from .monitor import logcat_dump
+    from .transport import logcat_dump
     full = logcat_dump(lines=max(400, int(duration_s * 30)))
     for ln in full.splitlines():
         for sdk, pats in SDK_MARKERS.items():
@@ -173,7 +173,7 @@ def probe(package: str, duration_s: float = 30.0, *,
         }
 
     # cameraserver + hook mapping.
-    from .monitor import cameraserver_hook_status
+    from .transport import cameraserver_hook_status
     cs = cameraserver_hook_status()
 
     pids = pgrep(f"^{re.escape(package)}$")
