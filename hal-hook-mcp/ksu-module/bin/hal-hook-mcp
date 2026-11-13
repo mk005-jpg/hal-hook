@@ -7,14 +7,33 @@
 #
 # Any args pass through to `python -m hal_hook_mcp`.
 
-# Derive MOD from this script's own location so the launcher works both from
+# Derive MOD from this script's own location so the launcher works from both
 # /data/adb/modules_update/ (pre-reboot staging) and /data/adb/modules/
-# (post-reboot active). `realpath` follows any symlink KSU may create.
+# (post-reboot active).
 SCRIPT="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 MOD="$(cd "$(dirname "$SCRIPT")/.." && pwd)"
-AH_LINUX=/data/user/0/com.androidharness.app/files/linux
-AH_PY="${AH_LINUX}/bin/python3"
 MOD_DEPS="${MOD}/deps"
+
+# Locate AH's bundled Python chroot. AH 3.x has shipped it in two layouts
+# across versions, and post-reboot it may move:
+#   * /data/local/tmp/androidharness/com.androidharness.app/linux   (3.4+ world-readable)
+#   * /data/user/0/com.androidharness.app/files/linux               (older, CE-encrypted)
+# Explicit override via $HAL_HOOK_AH_LINUX wins so we can pin a custom
+# interpreter if AH ever changes the layout again.
+if [ -n "${HAL_HOOK_AH_LINUX:-}" ] && [ -x "${HAL_HOOK_AH_LINUX}/bin/python3" ]; then
+    AH_LINUX="${HAL_HOOK_AH_LINUX}"
+elif [ -x /data/local/tmp/androidharness/com.androidharness.app/linux/bin/python3 ]; then
+    AH_LINUX=/data/local/tmp/androidharness/com.androidharness.app/linux
+elif [ -x /data/user/0/com.androidharness.app/files/linux/bin/python3 ]; then
+    AH_LINUX=/data/user/0/com.androidharness.app/files/linux
+else
+    echo "hal-hook-mcp: cannot find AndroidHarness python3 — looked at" >&2
+    echo "  /data/local/tmp/androidharness/com.androidharness.app/linux/" >&2
+    echo "  /data/user/0/com.androidharness.app/files/linux/" >&2
+    echo "Set HAL_HOOK_AH_LINUX=/path/to/linux to override." >&2
+    exit 127
+fi
+AH_PY="${AH_LINUX}/bin/python3"
 
 # AH's python needs its own libs (libandroid-support etc.) on LD path. We
 # ALSO prepend our module-private deps + pylib so imports resolve without
