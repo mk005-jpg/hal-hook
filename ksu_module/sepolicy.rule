@@ -1,0 +1,37 @@
+# hal_inject SELinux rules — applied natively by KernelSU / KernelSU-Next at boot
+# (read from /data/adb/modules/<id>/sepolicy.rule). No magiskpolicy needed.
+#
+# 1) Let the root/injector domain PTRACE_ATTACH cameraserver to load the hook.
+#    ksu = KernelSU(-Next) root domain; su/shell cover Magisk and adb-root setups.
+allow ksu cameraserver process ptrace
+allow su cameraserver process ptrace
+allow shell cameraserver process ptrace
+#
+# 2) libcam_hook.so runs INSIDE cameraserver and reads its inputs from
+#    /data/local/tmp/hal_inject (label shell_data_file): the hook .so itself,
+#    ctrl / ctrl_yuv / frame.jpg / frame.nv21 / frame.dim, and it writes
+#    stats.json. cameraserver cannot touch shell_data_file by default, so grant
+#    dir-traversal + file read/map + stats write. `execute`/`execute_no_trans` are
+#    REQUIRED so cameraserver can dlopen the hook .so (PROT_EXEC mapping) when it is
+#    loaded from the /data copy — the primary path is the /system/lib64 copy this
+#    module overlays, but the /data fallback silently fails to load without these.
+allow cameraserver shell_data_file dir { search open read getattr add_name write }
+allow cameraserver shell_data_file file { open read getattr map execute execute_no_trans create write }
+#
+# 3) The in-process hook installs an arm64 inline hook inside cameraserver: it
+#    needs an executable trampoline (execmem) and to patch the service's own
+#    .text — a modified file-backed executable mapping (execmod on the binary).
+allow cameraserver cameraserver process execmem
+allow cameraserver cameraserver_exec file execmod
+#
+# 4) Let the companion app (untrusted_app) reach the daemon's control socket at
+#    /data/local/tmp/hal_inject/daemon.sock (sock_file under shell_data_file,
+#    served by the ksu root domain), so the GUI buttons drive the daemon.
+allow untrusted_app shell_data_file dir search
+allow untrusted_app shell_data_file sock_file write
+allow untrusted_app ksu unix_stream_socket connectto
+#
+# 5) The app can't write /data/local/tmp, so it hands the daemon a JPEG in its own
+#    cache; let the root daemon read that app file to copy + convert it.
+allow ksu app_data_file dir search
+allow ksu app_data_file file { read open getattr }

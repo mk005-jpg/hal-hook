@@ -5,6 +5,13 @@
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
 
+    <!-- Camera2 warm-up: Export briefly opens the back camera so the hook
+         gets to write a FRESH real_yuv.nv21 snapshot of the current scene.
+         Without this, the backdrop in the composed BLOB is whatever stale
+         frame the hook had cached from the last app that used the camera. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+
     <application
         android:label="HAL Inject"
         android:theme="@style/Theme.AppCompat.DayNight.NoActionBar"
@@ -18,5 +25,9 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".FramePlacementActivity"
+            android:exported="false" />
     </application>
 </manifest>

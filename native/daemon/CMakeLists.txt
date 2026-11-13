@@ -17,8 +17,8 @@ add_executable(hal_inject_daemon
     main.cpp
     bpf_loader.cpp
     cam_detect.cpp
-    cam_maps.cpp
-    mem_writer.cpp
+    jpeg_yuv.cpp
+    imu.cpp
 )
 
 if(USE_BPF)
@@ -26,4 +26,6 @@ if(USE_BPF)
     target_link_libraries(hal_inject_daemon bpf elf z)
 endif()
 
-target_link_libraries(hal_inject_daemon log)
+# jnigraphics provides the NDK AImageDecoder used by jpeg_yuv.cpp (API 30+),
+# so the daemon converts JPEG -> NV21/NV12 natively without ffmpeg.
+target_link_libraries(hal_inject_daemon log jnigraphics android)

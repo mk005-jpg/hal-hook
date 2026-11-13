@@ -22,9 +22,9 @@ static uintptr_t page_floor(uintptr_t a) {
 bool inline_hook(void *target, void *replacement, void **trampoline_out) {
     if (!target || !replacement || !trampoline_out) return false;
 
-    // Allocate rwx call-through trampoline
+    // Allocate trampoline as RW first to avoid W^X / MDWE rejection on Android 14.
     void *tramp = mmap(NULL, TRAMP_SIZE,
-                       PROT_READ | PROT_WRITE | PROT_EXEC,
+                       PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (tramp == MAP_FAILED) return false;
 
@@ -39,11 +39,19 @@ bool inline_hook(void *target, void *replacement, void **trampoline_out) {
     memcpy(&jb[2], &cont, sizeof(cont));
     __builtin___clear_cache((char *)tramp, (char *)((uint8_t *)tramp + TRAMP_SIZE));
 
-    // Make target writable (two pages to handle split-page case)
+    // Switch trampoline to RX — write phase is complete.
+    if (mprotect(tramp, TRAMP_SIZE, PROT_READ | PROT_EXEC) != 0) {
+        munmap(tramp, TRAMP_SIZE);
+        return false;
+    }
+
+    // Make target writable WITHOUT execute (never W+X simultaneously — some
+    // Android 14 kernels enforce MDWE and reject RWX). The target is a private
+    // file-backed .text page; dropping X and adding W triggers copy-on-write,
+    // and restoring X afterwards needs SELinux execmod on the binary's type.
     uintptr_t page = page_floor((uintptr_t)target);
     int ps = getpagesize();
-    if (mprotect((void *)page, (size_t)ps * 2,
-                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+    if (mprotect((void *)page, (size_t)ps * 2, PROT_READ | PROT_WRITE) != 0) {
         munmap(tramp, TRAMP_SIZE);
         return false;
     }
@@ -54,9 +62,13 @@ bool inline_hook(void *target, void *replacement, void **trampoline_out) {
     h[1] = TRAMP_BR;
     uint64_t rep = (uint64_t)replacement;
     memcpy(&h[2], &rep, sizeof(rep));
-    __builtin___clear_cache((char *)target, (char *)((uint8_t *)target + HOOK_BYTES));
 
-    mprotect((void *)page, (size_t)ps * 2, PROT_READ | PROT_EXEC);
+    // Restore execute (R-X) and flush the i-cache for the patched range.
+    if (mprotect((void *)page, (size_t)ps * 2, PROT_READ | PROT_EXEC) != 0) {
+        munmap(tramp, TRAMP_SIZE);
+        return false;
+    }
+    __builtin___clear_cache((char *)target, (char *)((uint8_t *)target + HOOK_BYTES));
 
     *trampoline_out = tramp;
     return true;

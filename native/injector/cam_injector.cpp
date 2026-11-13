@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <dirent.h>
@@ -66,7 +67,10 @@ static pid_t find_pid(const char *proc_name) {
 }
 
 // First executable mapping of a library in the given PID's address space.
-static uintptr_t get_lib_base(pid_t pid, const char *lib_substr) {
+// Matches the basename EXACTLY — a loose substring match is a trap: "libdl"
+// also matches libdl_android.so (mapped at a different base), which corrupts the
+// base/offset arithmetic and makes the remote dlopen land on the wrong function.
+static uintptr_t get_lib_base(pid_t pid, const char *lib_name) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/maps", pid);
     FILE *f = fopen(path, "r");
@@ -81,7 +85,7 @@ static uintptr_t get_lib_base(pid_t pid, const char *lib_substr) {
                    &start, perms, fname) >= 2) {
             const char *bn = strrchr(fname, '/');
             bn = bn ? bn + 1 : fname;
-            if (strstr(bn, lib_substr) && perms[2] == 'x')
+            if (strcmp(bn, lib_name) == 0 && perms[2] == 'x')
                 base = (uintptr_t)start;
         }
     }
@@ -113,35 +117,76 @@ static bool remote_write_mem(pid_t pid, uintptr_t addr,
 
 // Execute dlopen in target via ptrace: set up call frame, CONT, wait for fault.
 // Returns the handle value (x0 on return), or 0 on failure.
+//
+// caller_lr MUST point inside a library already loaded in the target that lives
+// in the DEFAULT linker namespace (e.g. libcameraservice.so — NOT libc, which is
+// in the runtime APEX namespace). Android's libdl dlopen passes
+// __builtin_return_address(0) — i.e. the LR we set here — to the linker as the
+// "caller address", and the linker resolves the caller's linker NAMESPACE from
+// it. With LR=0 the linker finds no caller and the load fails; anchoring LR in a
+// default-namespace lib selects the namespace whose permitted_paths include /data.
 static uintptr_t remote_dlopen(pid_t pid, uintptr_t dlopen_addr,
-                                uintptr_t str_addr) {
+                                uintptr_t str_addr, uintptr_t caller_lr) {
     arm64_regs saved, call;
     if (!ptrace_get_regs(pid, &saved)) {
         perror("GETREGSET"); return 0;
     }
+
+    // Plant a BRK #0 at caller_lr so the return from dlopen traps
+    // DETERMINISTICALLY. Relying on the bytes at the return address to be an
+    // illegal instruction is unreliable — if they decode to something runnable
+    // the target keeps executing and the tracer hangs (and holds cameraserver
+    // under ptrace). caller_lr lies inside the target's libc, so it doubles as
+    // the dlopen caller address for linker-namespace resolution. POKETEXT does a
+    // private copy-on-write of the page, so other processes are unaffected.
+    errno = 0;
+    long orig = ptrace(PTRACE_PEEKTEXT, pid, (void *)caller_lr, 0);
+    if (orig == -1 && errno) { perror("PEEKTEXT"); return 0; }
+    long with_brk = (orig & ~0xFFFFFFFFL) | 0xD4200000L;   // BRK #0 in low 32 bits
+    if (ptrace(PTRACE_POKETEXT, pid, (void *)caller_lr, (void *)with_brk) != 0) {
+        perror("POKETEXT"); return 0;
+    }
+
     call            = saved;
+    call.sp         = (saved.sp - 0x8000) & ~15ULL;  // reserve scratch below the path string
     call.regs[0]    = str_addr;      // arg0: path
     call.regs[1]    = 2;             // arg1: RTLD_NOW
-    call.regs[30]   = 0;             // LR = NULL → SIGSEGV/SIGBUS on return
+    call.regs[30]   = caller_lr;     // LR = namespace anchor + breakpoint
     call.pc         = dlopen_addr;
+    if (!ptrace_set_regs(pid, &call)) {
+        perror("SETREGSET");
+        ptrace(PTRACE_POKETEXT, pid, (void *)caller_lr, (void *)orig);
+        return 0;
+    }
 
-    if (!ptrace_set_regs(pid, &call)) { perror("SETREGSET"); return 0; }
     ptrace(PTRACE_CONT, pid, NULL, NULL);
 
+    uintptr_t retval = 0;
     int status;
     while (waitpid(pid, &status, 0) > 0) {
-        if (!WIFSTOPPED(status)) continue;
+        if (!WIFSTOPPED(status)) break;
         int sig = WSTOPSIG(status);
-        if (sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGTRAP)
+        arm64_regs ret;
+        ptrace_get_regs(pid, &ret);
+        if (sig == SIGTRAP) {              // our breakpoint: dlopen has returned
+            fprintf(stderr, "[dbg] TRAP pc=0x%lx x0=0x%lx (anchor=0x%lx)\n",
+                    (unsigned long)ret.pc, (unsigned long)ret.regs[0],
+                    (unsigned long)caller_lr);
+            if (ret.pc == caller_lr || ret.pc == caller_lr + 4)
+                retval = ret.regs[0];      // x0 = dlopen handle (or NULL)
             break;
+        }
+        if (sig == SIGSEGV || sig == SIGBUS || sig == SIGILL) {
+            fprintf(stderr, "[dbg] FAULT sig=%d pc=0x%lx x0=0x%lx\n",
+                    sig, (unsigned long)ret.pc, (unsigned long)ret.regs[0]);
+            break;                         // dlopen faulted internally → failure
+        }
         ptrace(PTRACE_CONT, pid, NULL, (void *)(uintptr_t)sig);
     }
 
-    arm64_regs ret;
-    ptrace_get_regs(pid, &ret);
-    uintptr_t retval = ret.regs[0];  // dlopen return value (handle or NULL)
-
-    ptrace_set_regs(pid, &saved);    // restore process state
+    // Restore the clobbered instruction and the original register state.
+    ptrace(PTRACE_POKETEXT, pid, (void *)caller_lr, (void *)orig);
+    ptrace_set_regs(pid, &saved);
     return retval;
 }
 
@@ -176,7 +221,7 @@ int main(int argc, char **argv) {
     if (!local_dlopen) { fprintf(stderr, "[-] Cannot find dlopen\n"); return 1; }
 
     // Determine which lib provides dlopen in our process
-    const char *dlopen_libs[] = { "libdl", "linker64", nullptr };
+    const char *dlopen_libs[] = { "libdl.so", "linker64", nullptr };
     uintptr_t local_base = 0, remote_base = 0;
     for (int i = 0; dlopen_libs[i] && !local_base; i++) {
         local_base  = get_lib_base(getpid(), dlopen_libs[i]);
@@ -207,8 +252,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Place the path string 512 bytes below the current stack pointer (16-byte aligned).
-    uintptr_t str_addr = (regs.sp - 512) & ~15ULL;
+    // Place the path string well above the hijack SP (which we move 0x8000 down),
+    // so dlopen's own frames — realpath uses a PATH_MAX buffer — can't clobber it.
+    uintptr_t str_addr = (regs.sp - 0x4000) & ~15ULL;
     printf("[*] Writing lib path to 0x%lx\n", (unsigned long)str_addr);
 
     if (!remote_write_mem(target, str_addr, lib, libsz)) {
@@ -217,9 +263,20 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // Anchor the dlopen caller address inside a target library that lives in the
+    // DEFAULT linker namespace — the one whose permitted_paths include /data.
+    // libc.so is the WRONG choice: on Android 10+ it lives in the runtime APEX
+    // namespace, whose permitted_paths are APEX-only, so a dlopen attributed to
+    // libc cannot load from /data. libcameraservice.so (/system/lib64) is in the
+    // default namespace; fall back to the cameraserver executable, then libdl.
+    uintptr_t caller_lr = get_lib_base(target, "libcameraservice.so");
+    if (!caller_lr) caller_lr = get_lib_base(target, "cameraserver");   // main exe
+    if (!caller_lr) caller_lr = remote_base;
+    printf("[*] namespace anchor: 0x%lx\n", (unsigned long)caller_lr);
+
     // Execute dlopen in target
     printf("[*] Calling dlopen(\"%s\", RTLD_NOW) in target...\n", lib);
-    uintptr_t handle = remote_dlopen(target, remote_dlopen_addr, str_addr);
+    uintptr_t handle = remote_dlopen(target, remote_dlopen_addr, str_addr, caller_lr);
 
     ptrace(PTRACE_DETACH, target, NULL, NULL);
     printf("[+] Detached\n");

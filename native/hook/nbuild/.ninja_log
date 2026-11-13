@@ -1,0 +1,9 @@
+# ninja log v5
+4	190	8155438889523998	CMakeFiles/cam_hook.dir/inline_hook.cpp.o	1e87e76b8abfdcbc
+90	39878	8157834097098011	CMakeFiles/cam_hook.dir/libcam_hook.cpp.o	cc74efa0db3f0fbb
+39890	60575	8157834277132378	libcam_hook.so	8c25b505a310ff08
+5	264	8158161620232452	build.ninja	81242acc5edb77fd
+18	4472	8158161620232452	build.ninja	81242acc5edb77fd
+302	6415	8158161697819404	CMakeFiles/cam_hook.dir/libcam_hook.cpp.o	cc74efa0db3f0fbb
+14	3785	8158162221269934	CMakeFiles/cam_hook.dir/jpeg_rescale.cpp.o	d03c5dc8738a0948
+3839	5696	8158162242159855	libcam_hook.so	39ab920137ce1250

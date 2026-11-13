@@ -1,0 +1,3 @@
+E:/android pentesting/hal-inject/native/hook/nbuild/CMakeFiles/cam_hook.dir
+E:/android pentesting/hal-inject/native/hook/nbuild/CMakeFiles/edit_cache.dir
+E:/android pentesting/hal-inject/native/hook/nbuild/CMakeFiles/rebuild_cache.dir
