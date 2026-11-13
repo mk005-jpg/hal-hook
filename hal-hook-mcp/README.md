@@ -39,8 +39,43 @@ Works with any MCP client: Claude Desktop, Claude Code CLI, and on-device **Andr
 ### Escape hatch
 - `hal_adb_shell` — run any adb shell command on the device
 
-## Transport
+## Transport modes
 
+| Mode | Launch | Who talks to it |
+|---|---|---|
+| **stdio** (default) | `python -m hal_hook_mcp` | Claude Desktop, Claude Code — spawn as child process |
+| **HTTP/SSE** | `python -m hal_hook_mcp --http` | AndroidHarness on-device, remote Claude clients, any SSE-capable MCP client |
+
+### stdio
+Each request = one stdio line in, one line out. Nothing to configure.
+
+### HTTP/SSE
+```bash
+# Default: loopback-only, auto-generated bearer token printed on stderr
+python -m hal_hook_mcp --http
+# → [hal-hook-mcp] generated token: Oyf3-xW…
+# → [hal-hook-mcp] serving MCP/SSE at http://127.0.0.1:7731/sse
+# → [hal-hook-mcp] client header: Authorization: Bearer Oyf3-xW…
+
+# Custom host/port/token
+python -m hal_hook_mcp --http --host 127.0.0.1 --port 7731 --token my-secret
+# or: HAL_HOOK_MCP_TOKEN=my-secret python -m hal_hook_mcp --http
+
+# Dangerous: no auth (loopback-only or you'll regret it)
+python -m hal_hook_mcp --http --no-auth
+```
+
+Endpoints:
+- `GET /sse` — SSE event stream (MCP server→client). Requires `Authorization: Bearer <token>`.
+- `POST /messages/?session_id=…` — MCP client→server. Same auth.
+- `GET /healthz` — liveness probe. Unauthenticated.
+
+**Security**: bearer-token-over-plain-HTTP is only safe on a trusted hop
+(loopback, `adb reverse`, SSH tunnel). On any exposed network put this behind TLS.
+The auth check is a pure-ASGI pre-filter (NOT `BaseHTTPMiddleware`, which buffers
+responses and breaks SSE streaming).
+
+### Device transport
 Host → device: `adb shell su -c 'echo CMD | nc -w 2 -U /data/local/tmp/hal_inject/daemon.sock'` per call (~60-120 ms). For streaming (logcat), `adb logcat` is piped through a `subprocess.Popen` with a hard timer.
 
 Prereqs on the host:
@@ -101,16 +136,22 @@ Add to `~/.claude/mcp.json`:
 
 ## AndroidHarness config (on-device)
 
-AndroidHarness (Sanuu7 and forks) is an MCP *client*. To let it reach this server running on your desktop, expose MCP over a TCP forward:
+AndroidHarness (Sanuu7 and forks) is an MCP *client*. Use HTTP/SSE mode:
 
-1. Run the server as a stdio process behind a socat TCP wrapper on the desktop:
-   ```bash
-   socat TCP-LISTEN:7731,reuseaddr,fork EXEC:"python -m hal_hook_mcp"
-   ```
-2. On the phone, `adb reverse tcp:7731 tcp:7731` (adb must be running on the desktop too).
-3. In AndroidHarness, add an MCP server at `tcp://127.0.0.1:7731` (or whatever transport your fork supports).
+```bash
+# On the desktop:
+python -m hal_hook_mcp --http --token my-secret
+# → server listens on 127.0.0.1:7731
 
-The `adel107107ai` fork documents a bearer-token + 127.0.0.1 pattern — if security matters, wrap `socat` with a TLS cert + bearer check.
+# Also on the desktop (so the phone can reach it over USB):
+adb reverse tcp:7731 tcp:7731
+```
+
+In AndroidHarness, add a server:
+- URL: `http://127.0.0.1:7731/sse`
+- Header: `Authorization: Bearer my-secret`
+
+The `adel107107ai` AndroidHarness fork documents the exact pattern this follows (bearer-token-on-127.0.0.1 behind `adb reverse`). If you expose the port on your LAN, put TLS in front.
 
 ## Typical session
 
