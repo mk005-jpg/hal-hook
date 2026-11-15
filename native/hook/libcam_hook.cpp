@@ -359,6 +359,22 @@ static bool compute_pixel_displacement(uint64_t t_start, uint64_t t_end,
 // Lazy-resolved camera_metadata C API (from libcamera_metadata.so, already
 // loaded by cameraserver). Signatures from system/media/camera/include/system/.
 typedef struct camera_metadata camera_metadata_t;
+
+// Minimal mirror of Android's camera_metadata_entry_t (from system/camera_metadata.h).
+// Layout is stable across Android 10+.
+typedef struct camera_metadata_entry {
+    uint32_t tag;
+    uint8_t  type;
+    uint32_t count;
+    union {
+        uint8_t  *u8;
+        int32_t  *i32;
+        float    *f;
+        int64_t  *i64;
+        double   *d;
+    } data;
+    size_t   data_size;
+} camera_metadata_entry_t;
 // Matches AOSP's camera_metadata_ro_entry_t exactly:
 //   system/media/camera/include/system/camera_metadata.h
 //   size_t index; uint32_t tag; uint8_t type; size_t count; union { ... } data;
@@ -2093,6 +2109,60 @@ static void hook_send_capture_result(void *thiz,
 
             __asm__ volatile("dmb ish" ::: "memory");
             s->seq = next + 1;                       // even again (writer done)
+
+            // ── Metadata spoof ──────────────────────────────────────────────
+            // FaceTec / other KYC SDKs cross-check the injected image against
+            // the Camera2 CaptureResult metadata. The real metadata (timestamp,
+            // exposure, ISO) reflects the physical sensor, not our injected
+            // frame, so we overwrite the key entries in-place with values
+            // consistent with the injected content. Uses the libcamera_metadata
+            // update API so the buffer stays well-formed.
+            if (inject_enabled()) {
+                // Resolve the update function lazily (once).
+                static void (*g_update_entry)(camera_metadata_t *, camera_metadata_entry_t *,
+                                             uint32_t, const void *, size_t *) = nullptr;
+                static bool resolved = false;
+                if (!resolved) {
+                    void *h = dlopen("libcamera_metadata.so", RTLD_NOW | RTLD_NOLOAD);
+                    if (h) g_update_entry = (void(*)(camera_metadata_t*, camera_metadata_entry_t*, uint32_t, const void*, size_t*))
+                        dlsym(h, "update_camera_metadata_entry");
+                    if (!g_update_entry) g_update_entry = (void(*)(camera_metadata_t*, camera_metadata_entry_t*, uint32_t, const void*, size_t*))
+                        dlsym(RTLD_DEFAULT, "update_camera_metadata_entry");
+                    resolved = true;
+                }
+                // Resolve find_camera_metadata_entry (writable version) lazily.
+            static int (*g_find_entry)(camera_metadata_t *, uint32_t, camera_metadata_entry_t *) = nullptr;
+            static bool find_resolved = false;
+            if (!find_resolved) {
+                void *h = dlopen("libcamera_metadata.so", RTLD_NOW | RTLD_NOLOAD);
+                if (h) g_find_entry = (int(*)(camera_metadata_t*, uint32_t, camera_metadata_entry_t*))
+                    dlsym(h, "find_camera_metadata_entry");
+                if (!g_find_entry) g_find_entry = (int(*)(camera_metadata_t*, uint32_t, camera_metadata_entry_t*))
+                    dlsym(RTLD_DEFAULT, "find_camera_metadata_entry");
+                find_resolved = true;
+            }
+
+            if (g_update_entry && g_find_entry) {
+                camera_metadata_entry_t entry;
+                // Spoof SENSOR_TIMESTAMP: monotonically increasing per frame
+                if (g_find_entry((camera_metadata_t *)raw, TAG_SENSOR_TIMESTAMP, &entry) == 0) {
+                    uint64_t spoof_ts = (uint64_t)frameNumber * 33333333ULL;
+                    size_t dsz = sizeof(uint64_t);
+                    g_update_entry((camera_metadata_t *)raw, &entry, 1, &spoof_ts, &dsz);
+                }
+                    // Spoof SENSOR_EXPOSURE_TIME: fixed reasonable value
+                    if (g_find_entry((camera_metadata_t *)raw, TAG_EXPOSURE_TIME, &entry) == 0) {
+                        uint64_t spoof_exp = 10000000ULL; // 10 ms
+                        size_t dsz = sizeof(uint64_t);
+                        g_update_entry((camera_metadata_t *)raw, &entry, 1, &spoof_exp, &dsz);
+                    }
+                    // Spoof SENSOR_SENSITIVITY (ISO): fixed reasonable value
+                    if (g_find_entry((camera_metadata_t *)raw, TAG_SENSITIVITY, &entry) == 0) {
+                        int32_t spoof_iso = 200;
+                        size_t dsz = sizeof(int32_t);
+                        g_update_entry((camera_metadata_t *)raw, &entry, 1, &spoof_iso, &dsz);
+                    }
+                }
 
             // Low-rate log (every 60 frames so we don't flood logcat)
             if ((frameNumber % 60) == 0) {
