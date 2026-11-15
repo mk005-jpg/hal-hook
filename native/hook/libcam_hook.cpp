@@ -1575,15 +1575,32 @@ static void composite_yuv(void *dst,
         for (int k = 0; k < 256; k++) sig_lut[k] = sig_base * (float)SQRT_LUT[k];
     }
 
+    // ── Micro-movement (anti-static-detection) ─────────────────────────────
+    // Liveness / anti-injection analyzers check for frame-to-frame variation.
+    // A perfectly static injected image fails.  We add a slow sinusoidal
+    // sub-pixel drift (period ~3 s, amplitude ~1.5 px) to the source
+    // sampling so the ID text stays sharp (motion blur already handles
+    // fast motion) while the frame content visibly "breathes".
+    // g_inject_count is per-frame and monotonically increasing, so sin/cos
+    // of (count * step) gives a smooth, non-repeating trajectory.
+    const float MICRO_AMP  = 1.5f;          // pixels (source space)
+    const float MICRO_STEP = 0.003f;        // radians per frame (~3 s period at 30 fps)
+    float micro_phase = (float)g_inject_count * MICRO_STEP;
+    // Two independent sinusoids (different frequencies) for x and y so the
+    // path is Lissajous-like, not a simple circle.
+    int micro_dx = (int)(MICRO_AMP * sinf(micro_phase));
+    int micro_dy = (int)(MICRO_AMP * sinf(micro_phase * 1.37f + 0.7f));
+    // Clamp to ±1 source pixel to avoid OOB; the clamp below handles the rest.
+
     // Precompute si_lut[x] = (x - R.x0) * src_w / Rw once per frame — kills
     // the per-pixel integer divide, which was ~30 cycles / pixel on arm64.
-    // Luma loop now reads `si_lut[x] + shear_dx` instead of divide.
+    // Luma loop now reads `si_lut[x] + shear_dx + micro_dx`.
     int *si_lut = (int *)alloca(sizeof(int) * (size_t)(Rw + 1));
-    for (int x = 0; x < Rw; x++) si_lut[x] = x * src_w / Rw;
+    for (int x = 0; x < Rw; x++) si_lut[x] = x * src_w / Rw + micro_dx;
     // Chroma analogue (half-res).
     int Rcw = Rc.x1 - Rc.x0;
     int *si_c_lut = (int *)alloca(sizeof(int) * (size_t)(Rcw + 1));
-    for (int x = 0; x < Rcw; x++) si_c_lut[x] = x * csrc_w0 / (Rcw > 0 ? Rcw : 1);
+    for (int x = 0; x < Rcw; x++) si_c_lut[x] = x * csrc_w0 / (Rcw > 0 ? Rcw : 1) + (micro_dx >> 1);
 
     struct timespec _ts_pre; clock_gettime(CLOCK_MONOTONIC, &_ts_pre);
 
@@ -1593,7 +1610,7 @@ static void composite_yuv(void *dst,
     // When N_taps > 1 each output pixel averages N source samples along the
     // motion vector — the directional blur that matches real exposure.
     for (int y = R.y0; y < R.y1; y++) {
-        int sj_base = (y - R.y0) * src_h / Rh;
+        int sj_base = (y - R.y0) * src_h / Rh + micro_dy;
         // P1: which shear band is this row in?
         int band = shear_active
                  ? ((y - R.y0) * SHEAR_BANDS / Rh)
@@ -1658,7 +1675,7 @@ static void composite_yuv(void *dst,
     float dcx_tap = dsx_tap * 0.5f;
     float dcy_tap = dsy_tap * 0.5f;
     for (int y = Rc.y0; y < Rc.y1; y++) {
-        int sj_base = (y - Rc.y0) * csrc_h0 / Rch0;
+        int sj_base = (y - Rc.y0) * csrc_h0 / Rch0 + (micro_dy >> 1);
         // P1: shear band keyed by the LUMA rect coords (chroma is at ½-res,
         // so the equivalent luma row is y*2; same band table applies).
         int band = shear_active
