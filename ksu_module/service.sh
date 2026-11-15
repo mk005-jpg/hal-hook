@@ -46,6 +46,25 @@ done
 
 echo "[hal_inject] sepolicy rules applied" >&2
 
+# Stage the hook binaries into /data/local/tmp/hal_inject/ every boot. On some
+# devices /data/local/tmp/ gets scrubbed during userdata maintenance, which
+# otherwise leaves the daemon alive but with nothing to inject (STATUS reports
+# hook_loaded:false forever) — the user then has to re-push libcam_hook.so +
+# cam_injector by hand. We ship them in the module and overwrite-on-boot so
+# they're always present and match the module's version.
+MODDIR=${0%/*}
+mkdir -p /data/local/tmp/hal_inject
+for src in libcam_hook.so cam_injector; do
+    dst=/data/local/tmp/hal_inject/$src
+    if [ -f "$MODDIR/payload/$src" ]; then
+        cp -f "$MODDIR/payload/$src" "$dst"
+        if [ "$src" = "cam_injector" ]; then chmod 755 "$dst"
+        else                                  chmod 644 "$dst"
+        fi
+        echo "[hal_inject] staged $src ($(wc -c <"$dst") B)" >&2
+    fi
+done
+
 # Start the injection daemon in the background once the system has settled. It only
 # listens (ctrl stays off until the app/user sends START, which ptrace-loads the
 # hook), and its single-instance guard makes a duplicate launch a harmless no-op.

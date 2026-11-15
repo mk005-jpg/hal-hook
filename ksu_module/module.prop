@@ -1,6 +1,6 @@
 id=hal_inject_sepolicy
 name=HAL Inject SEPolicy Patch
-version=v2
-versionCode=2
+version=v2.1
+versionCode=21
 author=secpen
 description=Lets the injector ptrace cameraserver and lets cameraserver read the hook .so + control/frame files under /data/local/tmp. Applied via sepolicy.rule (KernelSU-native) with a live service.sh fallback.
